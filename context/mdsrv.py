@@ -10,6 +10,7 @@ import json
 import logging
 import datetime
 import functools
+import struct as packer
 
 # python 2 and 3 compatibility
 try:
@@ -301,7 +302,9 @@ def traj_frame( frame, root, filename ):
     )
 
 
-@app.route( '/traj/slice/<int:start>/<int:end>/<root>/<path:filename>', methods=['POST'] )
+@app.route( 
+    '/traj/slice/<int:start>/<int:end>/<root>/<path:filename>', 
+    methods=['POST'] )
 @requires_auth
 @crossdomain( origin='*' )
 def traj_slice( start, end, root, filename ):
@@ -313,7 +316,8 @@ def traj_slice( start, end, root, filename ):
     if directory:
         path = os.path.join( directory, filename )
     else:
-        return
+        # Return a proper 404 or error if the root directory is not found
+        return "Root directory not found", 404
     try:
         directory_struc = get_directory( struct[0] )
         struc_path = os.path.join( directory_struc, struct[1] )
@@ -325,15 +329,35 @@ def traj_slice( start, end, root, filename ):
             [ int( y ) for y in x.split( "," ) ]
             for x in atom_indices.split( ";" )
         ]
+
     traj = TRAJ_CACHE.get( path, struc_path )
     if not (0 <= start < end <= traj.numframes):
         return "Invalid frame range", 400
-    frame_data_list = []
+
+    # This list will hold the length-prefixed chunks of data
+    packed_data_list = []
+    # 在循环前打印请求范围，以便追踪
+    print("--- Requesting frames from {} to {} ---".format(start, end))
     for i in range(start, end):
-        frame_data_list.append(
-            traj.get_frame_string( i, atom_indices=atom_indices )
-        )
-    return b"".join(frame_data_list)
+        # Get the binary data for the single frame
+        frame_data = traj.get_frame_string( i, atom_indices=atom_indices )
+        # 打印每一帧的索引和获取到的数据长度
+        print("Frame: {}, Data Length: {}".format(i, len(frame_data)))
+
+        # In Python 3, frame_data is bytes, which is what we want.
+        # In Python 2, it might be a str, which is also fine.
+
+        # Pack the length of the frame_data as a 4-byte, big-endian, unsigned integer.
+        # This acts as a prefix so the client knows how many bytes to read for this frame.
+        packed_length = packer.pack('>I', len(frame_data))
+
+        # Append the length prefix first, then the actual frame data
+        packed_data_list.append(packed_length)
+        packed_data_list.append(frame_data)
+
+        # Join all the packed parts into a single binary stream and return it.
+    # The client will read a 4-byte length, then read that many bytes of data, and repeat.
+    return b"".join(packed_data_list)
 
 
 @app.route( '/traj/numframes/<root>/<path:filename>' )
