@@ -126,9 +126,12 @@ export class TrajectoryProxy {
     }
 
     // Case C: Chunk is not available. Fetch it.
+    const start = chunkIndex * this.chunkSize;
+    const end = Math.min((chunkIndex + 1) * this.chunkSize, this.getFrameCount());
+
     const fetchPromise = this.dataSource.getFrames(
-      chunkIndex * this.chunkSize,
-      (chunkIndex + 1) * this.chunkSize
+      start,
+      end
     ).then(chunkData => {
       this.pendingFetches.delete(chunkIndex);
       this.cache.set(chunkIndex, chunkData);
