@@ -1,106 +1,137 @@
-import { TrajectoryDataSource, FrameData as ProxyFrameData } from '../src/TrajectoryProxy';
+import { TrajectoryDataSource, FrameData } from '../src/TrajectoryProxy';
 
-// Define a more specific FrameData type based on the binary parsing logic.
+/**
+ * Defines the structure of a single frame parsed from the mdsrv binary format.
+ */
 export type ParsedFrameData = {
   coords: Float32Array;
   box: Float32Array;
 };
 
 /**
- * Parses a raw binary chunk from the mdsrv server into an array of frame objects.
- * This logic is based on the analysis of `remote-trajectory.ts`.
- * @param buffer The ArrayBuffer received from the server.
- * @returns An array of frame objects.
+ * Parses a raw binary buffer for a SINGLE frame.
+ * This function assumes it's receiving the data for exactly one frame, without any length prefix.
+ * @param buffer The ArrayBuffer for a single frame.
+ * @returns A parsed frame object.
  */
-function parseFramesFromBuffer(buffer: ArrayBuffer): ParsedFrameData[] {
-  // A valid buffer must at least contain the full header (11 * 4 = 44 bytes).
-  if (buffer.byteLength < 44) {
-    return [];
-  }
-
-  // The binary layout is as follows:
-  // - bytes 0-3: Int32, frameCountInChunk (seems to always be 1)
+function parseSingleFrameBuffer(buffer: ArrayBuffer): ParsedFrameData {
+  // The binary layout for a single frame is:
+  // - bytes 0-3: Int32, frameCountInChunk (always 1)
   // - bytes 4-7: Float32, time (ignored)
   // - bytes 8-43: 9 * Float32, box matrix
   // - bytes 44-onwards: N * Float32, coordinates
-
-  const frameCountInChunk = new Int32Array(buffer, 0, 1)[0];
-  if (frameCountInChunk !== 1) {
-    // This implementation assumes the server sends one frame per buffer, as suggested by the context files.
-    // If the server could send multiple frames, a more complex loop would be needed here.
-    console.warn(`Buffer indicates ${frameCountInChunk} frames, but we are parsing only one.`);
+  if (buffer.byteLength < 44) {
+    throw new Error(`Frame buffer is too small to be valid (${buffer.byteLength} bytes).`);
   }
-
-  // Read 9 floats for the box matrix, starting at byte offset 8 (2 * 4).
   const box = new Float32Array(buffer, 8, 9);
-  // Read all remaining floats for the coordinates, starting at byte offset 44 (11 * 4).
   const coords = new Float32Array(buffer, 44);
-
-  // Return an array containing the single parsed frame object.
-  return [{ coords, box }];
+  return { coords, box };
 }
 
+/**
+ * Parses a chunked buffer from the corrected /traj/slice endpoint.
+ * The buffer is expected to be a sequence of [4-byte length][data] chunks.
+ * @param buffer The complete ArrayBuffer received from the server.
+ * @returns An array of parsed frame objects.
+ */
+function parseChunkedBuffer(buffer: ArrayBuffer): ParsedFrameData[] {
+  const frames: ParsedFrameData[] = [];
+  const dataView = new DataView(buffer);
+  let offset = 0;
+
+  while (offset < buffer.byteLength) {
+    // Check if there's enough space for the 4-byte length prefix.
+    if (offset + 4 > buffer.byteLength) {
+      console.warn('Remaining buffer is too small for a length prefix.');
+      break;
+    }
+
+    // Read the length of the next frame chunk (big-endian).
+    const frameLength = dataView.getUint32(offset, false);
+    offset += 4;
+
+    // Check if the buffer contains the full frame data as promised by the length prefix.
+    if (offset + frameLength > buffer.byteLength) {
+      console.error('Buffer is truncated. Expected more data than available.');
+      break;
+    }
+
+    // Slice the buffer to get the data for a single frame.
+    const frameBuffer = buffer.slice(offset, offset + frameLength);
+
+    // Parse the single frame buffer.
+    frames.push(parseSingleFrameBuffer(frameBuffer));
+
+    // Move the offset to the beginning of the next chunk.
+    offset += frameLength;
+  }
+
+  return frames;
+}
 
 /**
  * An implementation of the TrajectoryDataSource interface that communicates with
- * a mdsrv.py compatible server.
+ * a mdsrv.py compatible server with the corrected `traj_slice` endpoint.
  */
 export class MdsrvDataSource implements TrajectoryDataSource {
   private readonly baseUrl: string;
-  private readonly filePath: string;
+  private readonly root: string;
+  private readonly filename: string;
 
   constructor(options: {
     baseUrl: string;   // e.g., "http://localhost:5000"
-    filePath: string;  // e.g., "trajectories/1crn.xtc"
+    root: string;      // The data root on the server, e.g., "cwd"
+    filename: string;  // The path to the file within the root, e.g., "data/trajectory.xtc"
   }) {
-    // Remove trailing slashes to ensure URL concatenation is correct
-    this.baseUrl = options.baseUrl.endsWith('/') 
-      ? options.baseUrl.slice(0, -1) 
+    this.baseUrl = options.baseUrl.endsWith('/')
+      ? options.baseUrl.slice(0, -1)
       : options.baseUrl;
-    this.filePath = options.filePath;
+    this.root = options.root;
+    this.filename = options.filename;
   }
 
   /**
-   * Implements the getMetadata method by calling the /header endpoint.
+   * Implements the getMetadata method by calling the /traj/numframes endpoint.
    */
-  public async getMetadata(): Promise<any> {
-    const url = `${this.baseUrl}/header/${this.filePath}`;
-    console.log(`Fetching metadata from: ${url}`);
-
+  public async getMetadata(): Promise<{ frameCount: number }> {
+    const url = `${this.baseUrl}/traj/numframes/${this.root}/${this.filename}`;
     try {
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`Failed to fetch metadata: ${response.status} ${response.statusText}`);
       }
-      return response.json();
+      const frameCountStr = await response.text();
+      const frameCount = parseInt(frameCountStr, 10);
+      if (isNaN(frameCount)) {
+        throw new Error(`Invalid frame count received: "${frameCountStr}"`);
+      }
+      return { frameCount };
     } catch (error) {
-      console.error("Error in getMetadata:", error);
+      console.error(`Error in getMetadata at ${url}:`, error);
       throw error;
     }
   }
 
   /**
-   * Implements the getFrames method by calling the /traj/... slice endpoint.
+   * Implements the getFrames method by calling the corrected /traj/slice endpoint.
    */
-  public async getFrames(start: number, end: number): Promise<ProxyFrameData[]> {
-    const url = `${this.baseUrl}/traj/${this.filePath}/${start}:${end}`;
-    console.log(`Fetching frames from: ${url}`);
-
+  public async getFrames(start: number, end: number): Promise<FrameData[]> {
+    const url = `${this.baseUrl}/traj/slice/${start}/${end}/${this.root}/${this.filename}`;
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        method: 'POST',
+        body: new URLSearchParams() // Send empty body as atom_indices is optional
+      });
+
       if (!response.ok) {
-        throw new Error(`Failed to fetch frames: ${response.status} ${response.statusText}`);
+        throw new Error(`Failed to fetch frames ${start}-${end}: ${response.status} ${response.statusText}`);
       }
 
-      // The mdsrv.py server returns binary data (application/octet-stream)
       const buffer = await response.arrayBuffer();
+      return parseChunkedBuffer(buffer);
 
-      // Parse the binary buffer into structured frame data.
-      const frames: ParsedFrameData[] = parseFramesFromBuffer(buffer);
-      
-      return frames;
     } catch (error) {
-      console.error("Error in getFrames:", error);
+      console.error(`Error in getFrames for range ${start}-${end} at ${url}:`, error);
       throw error;
     }
   }
