@@ -1,0 +1,28 @@
+{
+  "name": "ngl-data-proxy",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/ngl-data-proxy.umd.cjs",
+  "module": "./dist/ngl-data-proxy.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/ngl-data-proxy.js",
+      "require": "./dist/ngl-data-proxy.umd.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3"
+  }
+}
