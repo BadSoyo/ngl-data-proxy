@@ -182,7 +182,13 @@ export class TrajectoryProxy {
     while (this.cache.size > this.maxCacheSize) {
       // A Map iterates in insertion order, so the first key is the oldest.
       const oldestChunkIndex = this.cache.keys().next().value;
-      this.cache.delete(oldestChunkIndex);
+      // The iterator's result can be undefined in theory, so we must check.
+      if (oldestChunkIndex !== undefined) {
+        this.cache.delete(oldestChunkIndex);
+      } else {
+        // This case should not be reachable if cache.size > 0, but we break to be safe.
+        break;
+      }
     }
   }
 }
