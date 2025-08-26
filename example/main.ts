@@ -1,100 +1,161 @@
+declare const NGL: any;
 import { TrajectoryProxy } from '../src/TrajectoryProxy';
-import { MdsrvDataSource } from './MdsrvDataSource';
-import type { ParsedFrameData } from './MdsrvDataSource';
+import { MdsrvDataSource as CustomMdsrvDataSource } from './MdsrvDataSource';
 
 // --- Configuration ---
-const SERVER_BASE_URL = 'http://127.0.0.1:38359';
-const TRAJECTORY_ROOT = 'cwd'; // The root directory on the mdsrv server
-const TRAJECTORY_FILENAME = 'data/md.xtc'; // The file path within the root
+const SERVER_BASE_URL = 'http://127.0.0.1:38359/';
+const TRAJECTORY_ROOT = 'cwd';
+const STRUCTURE_FILENAME = 'data/md.gro';
+const TRAJECTORY_FILENAME = 'data/md.xtc';
 
 // --- UI Elements ---
-const viewport = document.getElementById('viewport');
-if (!viewport) {
-  throw new Error('The application requires a #viewport element in the HTML.');
-}
+const playBtn = document.getElementById('playBtn') as HTMLButtonElement;
+const slider = document.getElementById('slider') as HTMLInputElement;
+const frameLabel = document.getElementById('frameLabel') as HTMLSpanElement;
 
-// Clear the viewport and apply styles for our demo UI
-viewport.innerHTML = '';
-viewport.style.cssText = 'font-family: sans-serif; padding: 20px;';
+// --- NGL Stage Setup ---
+const stage = new NGL.Stage('viewport', { backgroundColor: 'white' });
+window.addEventListener('resize', () => stage.handleResize());
 
-const metadataDiv = document.createElement('div');
-metadataDiv.innerHTML = '<h2>Metadata</h2><pre id="metadata-output"></pre>';
-viewport.appendChild(metadataDiv);
-
-const frameTestDiv = document.createElement('div');
-frameTestDiv.innerHTML = '<h2>Frame Test</h2><input type="number" id="frame-input" placeholder="Frame Index" value="0" style="padding: 8px; margin-right: 10px;"><button id="get-frame-btn" style="padding: 8px 15px;">Get Frame</button><pre id="frame-output" style="max-height: 300px; overflow-y: auto; background: #f0f0f0; padding: 10px; border-radius: 5px;"></pre>';
-viewport.appendChild(frameTestDiv);
-
-const logDiv = document.createElement('div');
-logDiv.innerHTML = '<h2>Logs</h2><pre id="log-output" style="max-height: 200px; overflow-y: auto; background: #e0e0e0; padding: 10px; border-radius: 5px;"></pre>';
-viewport.appendChild(logDiv);
-
-const metadataOutput = document.getElementById('metadata-output') as HTMLPreElement;
-const frameInput = document.getElementById('frame-input') as HTMLInputElement;
-const getFrameBtn = document.getElementById('get-frame-btn') as HTMLButtonElement;
-const frameOutput = document.getElementById('frame-output') as HTMLPreElement;
-const logOutput = document.getElementById('log-output') as HTMLPreElement;
-
-// Simple logging function to display messages in the UI
-function log(message: string) {
-  const p = document.createElement('p');
-  p.innerText = `[${new Date().toLocaleTimeString()}] ${message}`;
-  logOutput.appendChild(p);
-  logOutput.scrollTop = logOutput.scrollHeight; // Scroll to bottom
-}
+let player: any | undefined;
+let traj: any | undefined;
+let isPlaying = false;
 
 /**
- * Main function to set up the TrajectoryProxy and UI interactions.
+ * Main function to set up the NGL player with our custom trajectory proxy.
  */
 async function main() {
-  log('Initializing TrajectoryProxy...');
+  // --- Part 1: Setup for Structure Loading (using NGL's MdsrvDataSource) ---
+  const nglMdsrv = new NGL.MdsrvDatasource(SERVER_BASE_URL);
+  NGL.DatasourceRegistry.add('mdsrv', nglMdsrv);
 
-  const dataSource = new MdsrvDataSource({
+  // --- Part 2: Setup for Trajectory Loading (using our custom proxy) ---
+  const customDataSource = new CustomMdsrvDataSource({
     baseUrl: SERVER_BASE_URL,
     root: TRAJECTORY_ROOT,
     filename: TRAJECTORY_FILENAME,
   });
 
   const proxy = new TrajectoryProxy({
-    dataSource: dataSource,
-    chunkSize: 100, // Number of frames per chunk
-    maxCacheSize: 10,   // Maximum number of chunks to keep in memory
+    dataSource: customDataSource,
+    chunkSize: 100,
+    maxCacheSize: 10,
   });
 
   try {
     await proxy.init();
-    log(`Proxy initialized. Total frames: ${proxy.getFrameCount()}`);
-    metadataOutput.textContent = JSON.stringify(proxy.getMetadata(), null, 2);
-    frameInput.max = (proxy.getFrameCount() - 1).toString();
+    console.log(`TrajectoryProxy initialized. Frame count: ${proxy.getFrameCount()}`);
+  } catch (error) {
+    console.error('Failed to initialize TrajectoryProxy:', error);
+    alert('Error initializing trajectory proxy. See console for details.');
+    return;
+  }
 
-    getFrameBtn.addEventListener('click', async () => {
-      const frameIndex = parseInt(frameInput.value, 10);
-      if (isNaN(frameIndex) || frameIndex < 0 || frameIndex >= proxy.getFrameCount()) {
-        log(`Invalid frame index: ${frameInput.value}`);
-        return;
-      }
+  // --- Part 3: The "Glue" - The Request Callback for CallbackTrajectory ---
+  const frameRequestCallback = (
+    responseCallback: Function, // Generic function type
+    frameIndex?: number
+  ) => {
+    // --- DEBUGGING ---
+    // console.log(`frameRequestCallback invoked. frameIndex: ${frameIndex}`);
+    // -----------------
+    // Case 1: Initial call to get the frame count.
+    if (frameIndex === undefined) {
+      // The response callback expects only one argument: the count.
+      responseCallback(proxy.getFrameCount());
+      return;
+    }
 
-      log(`Requesting frame: ${frameIndex}...`);
-      try {
-        const frameData = await proxy.getFrame(frameIndex) as ParsedFrameData;
-        frameOutput.textContent = JSON.stringify({
-          frameIndex: frameIndex,
-          coordsLength: frameData.coords.length,
-          box: Array.from(frameData.box) // Convert TypedArray to regular Array for display
-        }, null, 2);
-        log(`Frame ${frameIndex} received.`);
-      } catch (error: any) {
-        log(`Error getting frame ${frameIndex}: ${error.message}`);
-        frameOutput.textContent = `Error: ${error.message}`;
-        console.error(error);
-      }
+    // Case 2: Call to get a specific frame's data.
+    proxy.getFrame(frameIndex).then(frameData => {
+      // The response callback expects four arguments: index, box, coords, count.
+      responseCallback(
+        frameIndex,
+        frameData.box,
+        frameData.coords,
+        proxy.getFrameCount()
+      );
+    }).catch(error => {
+      console.error(`Error fetching frame ${frameIndex} via proxy:`, error);
+    });
+  };
+
+  // --- Part 4: Load Structure and then add Trajectory ---
+  const structureUrl = nglMdsrv.getUrl(`${TRAJECTORY_ROOT}/${STRUCTURE_FILENAME}`);
+  stage.loadFile(structureUrl).then(o => {
+    console.log('Structure loaded:', `${TRAJECTORY_ROOT}/${STRUCTURE_FILENAME}`);
+    console.log('StructureComponent (o) details:', {
+      name: o.structure.name,
+      atomCount: o.structure.atomCount,
+      bondCount: o.structure.bondCount,
+      residueCount: o.structure.residueCount,
+      chainCount: o.structure.chainCount
+    });
+    o.addRepresentation('cartoon');
+    const hasPolymer = o.structure.polymerResidueCount > 0;
+    o.addRepresentation(hasPolymer ? "cartoon" : "ball+stick", hasPolymer ? {} : { multipleBond: true });
+
+    o.autoView();
+
+    // Pass the callback function directly as the first argument to addTrajectory
+    const trajComp = o.addTrajectory(
+      frameRequestCallback, // Let NGL's makeTrajectory handle the creation
+      proxy.getMetadata()   // Pass metadata as the second argument (params)
+    );
+
+    traj = trajComp.trajectory;
+    console.log('Trajectory ready. Frame count:', traj.frameCount);
+
+    slider.max = (traj.frameCount - 1).toString();
+    slider.value = '0';
+    frameLabel.textContent = '0';
+
+    player = new NGL.TrajectoryPlayer(traj, {
+      step: 1,
+      timeout: 60, // milliseconds
+      mode: 'loop'
     });
 
-  } catch (error: any) {
-    log(`Failed to initialize TrajectoryProxy: ${error.message}`);
-    console.error('Failed to setup TrajectoryProxy:', error);
-  }
+    traj.signals.frameChanged.add((value: number) => {
+      slider.value = value.toString();
+      frameLabel.textContent = value.toString();
+    });
+
+  }).catch(err => {
+    console.error('Failed to load structure:', err);
+    alert('Failed to load structure file. See console for details.');
+  });
+
+  // --- Part 5: Connect UI Controls ---
+  playBtn.onclick = () => {
+    if (!player) {
+      console.log('Player not ready yet.');
+      return;
+    }
+    if (isPlaying) {
+      console.log('Calling player.pause()');
+      player.pause();
+      playBtn.textContent = 'Play';
+    } else {
+      console.log('Calling player.play()');
+      player.play();
+      playBtn.textContent = 'Pause';
+    }
+    isPlaying = !isPlaying;
+  };
+
+  slider.oninput = () => {
+    if (traj) {
+      if (isPlaying) {
+        console.log('Scrubbing detected, pausing playback.');
+        player.pause();
+        isPlaying = false;
+        playBtn.textContent = 'Play';
+      }
+      const frame = parseInt(slider.value, 10);
+      traj.setFrame(frame);
+    }
+  };
 }
 
-// Run the main setup function
 main();
