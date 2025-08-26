@@ -1,0 +1,126 @@
+<html>
+<head>
+  <meta charset="utf-8" />
+  <!-- NGL 库保持不变 -->
+  <script src="https://unpkg.com/ngl@2.2.2/dist/ngl.js"></script>
+  <style>
+    body { margin: 0; }
+    #viewport { width: 100%; height: 70vh; display: block; background: #fff; }
+    #controls { display: flex; gap: 8px; align-items: center; padding: 8px; }
+    #slider { flex: 1; }
+  </style>
+</head>
+<body>
+  <div id="viewport"></div>
+  <div id="controls">
+    <button id="playBtn">Play</button>
+    <input id="slider" type="range" value="0" min="0" />
+    <span id="frameLabel">0</span>
+  </div>
+
+  <script>
+    // === 必填：你的本地文件（现在是相对于 mdsrv 根目录的路径） ===
+    // 假设你的 mdsrv 服务器启动在包含 dump.pdb 和 dump.dcd 的目录
+    const STRUCTURE_PATH = "cwd/dump.pdb";
+    const TRAJ_PATH      = "cwd/large_file.xyz";
+
+    // --- 1. 核心更改：注册本地 mdsrv 数据源 ---
+    // 告诉 NGL，我们有一个名为 "mdsrv" 的数据源，
+    // 它指向与此网页相同的服务器地址。
+    // `window.location.origin` 会自动获取 "http://localhost:XXXX" 或 "http://127.0.0.1:XXXX"
+    var mdsrvDatasource = new NGL.MdsrvDatasource("http://127.0.0.1:33391/")
+    NGL.DatasourceRegistry.add(
+        "mdsrv", mdsrvDatasource
+    );
+    NGL.setListingDatasource(mdsrvDatasource)
+    NGL.setTrajectoryDatasource(mdsrvDatasource)
+
+    const stage = new NGL.Stage("viewport", { backgroundColor: "white" });
+    window.addEventListener("resize", () => stage.handleResize());
+
+    const playBtn = document.getElementById("playBtn");
+    const slider  = document.getElementById("slider");
+    const frameLabel = document.getElementById("frameLabel");
+
+    let player, traj;
+    let isPlaying = false;
+
+    // --- 2. 更改加载方式：使用字符串路径和数据源前缀 ---
+    // 我们使用 "mdsrv://<路径>" 的格式来告诉 stage.loadFile()
+    // 使用我们刚刚注册的 "mdsrv" 数据源来加载文件。
+    console.log("[NGL] Loading structure from mdsrv:", STRUCTURE_PATH);
+    stage.loadFile(`mdsrv://${STRUCTURE_PATH}`).then(o => {
+      console.log("[NGL] Structure loaded. atomCount =", o.structure.atomCount);
+
+      const hasPolymer = o.structure.polymerResidueCount > 0;
+      o.addRepresentation(hasPolymer ? "cartoon" : "ball+stick", hasPolymer ? {} : { multipleBond: true });
+      o.autoView();
+
+      // --- 3. 更改轨迹加载方式：直接将路径字符串传给 addTrajectory ---
+      // 这是最关键的改变。我们不再使用 NGL.autoLoad 预先加载轨迹。
+      // 而是直接将轨迹文件的路径（同样带上数据源前缀）传给 addTrajectory。
+      // NGL 内部的 `makeTrajectory` 函数会识别出这是一个字符串，
+      // 并自动创建一个 `RemoteTrajectory` 对象去加载它。
+      console.log("[NGL] Loading trajectory from mdsrv:", TRAJ_PATH);
+    //   const trajComp = o.addTrajectory(`mdsrv://${TRAJ_PATH}`);
+      const trajComp = o.addTrajectory(`mdsrv://${TRAJ_PATH}`);
+      traj = trajComp.trajectory;
+
+      // 在轨迹真正加载完成前，numframes 可能是 0。
+      // 我们需要监听 "frameChanged" 或等待 trajectory 的 promise。
+      // 为了简单起见，我们假设轨迹加载很快，或者在用户交互前完成。
+      // 一个更健壮的方法是监听 traj.signals.countChanged。
+      traj.signals.countChanged.add(function (count) {
+        if (count > 0) {
+            console.log("[NGL] Trajectory loaded. numframes =", traj.numframes);
+
+            if (traj.atomCount !== o.structure.atomCount) {
+              console.warn("[NGL] Atom count mismatch! Animation will not play correctly.");
+            }
+
+            // 初始化播放器
+            player = new NGL.TrajectoryPlayer(traj, {
+              step: 1,
+              timeout: 60,
+              mode: "loop"
+            });
+
+            // 同步滑条
+            slider.max = traj.numframes - 1;
+            traj.setFrame(0);
+            frameLabel.textContent = "0";
+
+            console.log("[NGL] Ready. Use Play button to start.");
+        }
+      });
+
+      // 帧变化事件 -> 更新滑条与标签
+      traj.signals.frameChanged.add(value => {
+        slider.value = value;
+        frameLabel.textContent = String(value);
+      });
+
+    }).catch(err => {
+      console.error("[NGL] Failed to init:", err);
+    });
+
+    // 播放/暂停（无需更改）
+    playBtn.onclick = () => {
+      if (!player) return;
+      if (isPlaying) {
+        player.pause();
+        playBtn.textContent = "Play";
+      } else {
+        player.play();
+        playBtn.textContent = "Pause";
+      }
+      isPlaying = !isPlaying;
+    };
+
+    // 拖动到特定帧（无需更改）
+    slider.oninput = () => {
+      if (traj) traj.setFrame(parseInt(slider.value, 10));
+    };
+  </script>
+</body>
+</html>
