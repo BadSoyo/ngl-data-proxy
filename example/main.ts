@@ -5,8 +5,8 @@ import { MdsrvDataSource as CustomMdsrvDataSource } from './MdsrvDataSource';
 // --- Configuration ---
 const SERVER_BASE_URL = 'http://127.0.0.1:38359/';
 const TRAJECTORY_ROOT = 'cwd';
-const STRUCTURE_FILENAME = 'data/md_1u19.gro';
-const TRAJECTORY_FILENAME = 'data/md_1u19.xtc';
+const STRUCTURE_FILENAME = 'data/md.gro';
+const TRAJECTORY_FILENAME = 'data/md.xtc';
 
 // --- UI Elements ---
 const playBtn = document.getElementById('playBtn') as HTMLButtonElement;
@@ -84,7 +84,17 @@ async function main() {
   const structureUrl = nglMdsrv.getUrl(`${TRAJECTORY_ROOT}/${STRUCTURE_FILENAME}`);
   stage.loadFile(structureUrl).then(o => {
     console.log('Structure loaded:', `${TRAJECTORY_ROOT}/${STRUCTURE_FILENAME}`);
+    console.log('StructureComponent (o) details:', {
+      name: o.structure.name,
+      atomCount: o.structure.atomCount,
+      bondCount: o.structure.bondCount,
+      residueCount: o.structure.residueCount,
+      chainCount: o.structure.chainCount
+    });
     o.addRepresentation('cartoon');
+    const hasPolymer = o.structure.polymerResidueCount > 0;
+    o.addRepresentation(hasPolymer ? "cartoon" : "ball+stick", hasPolymer ? {} : { multipleBond: true });
+
     o.autoView();
 
     // Pass the callback function directly as the first argument to addTrajectory
