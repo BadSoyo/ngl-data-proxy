@@ -1,5 +1,6 @@
 declare const NGL: any;
-import { TrajectoryProxy } from '../src/TrajectoryProxy';
+// import { TrajectoryProxy } from '../src/TrajectoryProxy';
+import { TrajectoryProxy } from 'ngl-data-proxy';
 import { MdsrvDataSource as CustomMdsrvDataSource } from './MdsrvDataSource';
 
 // --- Configuration ---

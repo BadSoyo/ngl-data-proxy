@@ -1,7 +1,7 @@
 {
   "name": "ngl-data-proxy",
-  "private": true,
-  "version": "0.0.0",
+  "private": false,
+  "version": "0.1.0",
   "type": "module",
   "main": "./dist/ngl-data-proxy.umd.cjs",
   "module": "./dist/ngl-data-proxy.js",
@@ -22,6 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
+    "ngl-data-proxy": "^0.1.0",
     "typescript": "^5.9.2",
     "vite": "^7.1.3"
   }
