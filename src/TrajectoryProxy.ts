@@ -1,197 +1,314 @@
 
+import { get, set, del, createStore, UseStore } from 'idb-keyval';
+
 // A placeholder for the actual frame data structure.
-export type FrameData = any;
+// Assuming FrameData is an object with a `byteLength` property for size calculation.
+export type FrameData = {
+  coords: Float32Array;
+  box: Float32Array;
+};
+// export type FrameData = any;
+
 
 /**
  * Defines the contract for a data source that can provide trajectory metadata and frame data.
- * This allows the TrajectoryProxy to be decoupled from the actual data fetching implementation (e.g., REST API, WebSocket).
+ * This allows the TrajectoryProxy to be decoupled from the actual data fetching implementation.
  */
 export interface TrajectoryDataSource {
-  /**
-   * Asynchronously retrieves metadata for the trajectory.
-   * The returned object is expected to contain at least a `frameCount` property.
-   */
   getMetadata: () => Promise<any>;
-
-  /**
-   * Asynchronously retrieves a chunk of frames.
-   * @param start - The starting frame index (inclusive).
-   * @param end - The ending frame index (exclusive).
-   * @returns A promise that resolves to an array of frames.
-   */
   getFrames: (start: number, end: number) => Promise<FrameData[]>;
 }
 
+// Internal node for the doubly linked list in the LRU cache.
+class LRUNode<K, V> {
+    constructor(public key: K, public value: V, public prev: LRUNode<K, V> | null = null, public next: LRUNode<K, V> | null = null) {}
+}
+
+// Generic LRU Cache implementation using a Map and a doubly linked list.
+class LRUCache<K, V> {
+    private capacity: number;
+    private cache = new Map<K, LRUNode<K, V>>();
+    private head: LRUNode<K, V> | null = null;
+    private tail: LRUNode<K, V> | null = null;
+
+    constructor(capacity: number) {
+        this.capacity = capacity;
+    }
+
+    get(key: K): V | undefined {
+        if (this.cache.has(key)) {
+            const node = this.cache.get(key)!;
+            this.moveToHead(node);
+            return node.value;
+        }
+        return undefined;
+    }
+
+    set(key: K, value: V): { evicted?: { key: K, value: V } } {
+        let evicted;
+        if (this.cache.has(key)) {
+            const node = this.cache.get(key)!;
+            node.value = value;
+            this.moveToHead(node);
+        } else {
+            const node = new LRUNode(key, value);
+            this.cache.set(key, node);
+            this.addToHead(node);
+            if (this.cache.size > this.capacity) {
+                evicted = this.evictTail();
+            }
+        }
+        return { evicted };
+    }
+    
+    has(key: K): boolean {
+        return this.cache.has(key);
+    }
+
+    private addToHead(node: LRUNode<K, V>) {
+        node.next = this.head;
+        node.prev = null;
+        if (this.head) {
+            this.head.prev = node;
+        }
+        this.head = node;
+        if (!this.tail) {
+            this.tail = node;
+        }
+    }
+
+    private removeNode(node: LRUNode<K, V>) {
+        if (node.prev) {
+            node.prev.next = node.next;
+        } else {
+            this.head = node.next;
+        }
+        if (node.next) {
+            node.next.prev = node.prev;
+        } else {
+            this.tail = node.prev;
+        }
+    }
+
+    private moveToHead(node: LRUNode<K, V>) {
+        this.removeNode(node);
+        this.addToHead(node);
+    }
+
+    private evictTail(): { key: K, value: V } | undefined {
+        const tail = this.tail;
+        if (tail) {
+            this.removeNode(tail);
+            this.cache.delete(tail.key);
+            return { key: tail.key, value: tail.value };
+        }
+        return undefined;
+    }
+}
+
+
 /**
- * A proxy for a remote trajectory file that provides caching, pre-fetching,
- * and a responsive, concurrent data access model.
+ * A proxy for a remote trajectory file that provides a two-level (memory, IndexedDB)
+ * cache, pre-fetching, and atomic, transactional data access.
  */
 export class TrajectoryProxy {
-  private readonly dataSource: TrajectoryDataSource;
-  private readonly chunkSize: number;
-  private readonly maxCacheSize: number;
+    private readonly dataSource: TrajectoryDataSource;
+    private readonly targetChunkSizeInBytes: number;
+    private readonly l1CacheSizeInChunks: number;
+    private readonly l2CacheSizeInBytes: number;
 
-  private metadata: any | null = null;
-  private cache = new Map<number, FrameData[]>();
-  private pendingFetches = new Map<number, Promise<FrameData[]>>();
+    private l1Cache: LRUCache<number, FrameData[]>;
+    private l2Cache: LRUCache<number, { size: number }>; // L2 stores metadata (size) in memory
+    private l2Store: UseStore;
+    private l2CurrentSizeInBytes = 0;
 
-  constructor(options: {
-    dataSource: TrajectoryDataSource;
-    chunkSize: number;
-    maxCacheSize: number;
-  }) {
-    if (options.chunkSize <= 0 || options.maxCacheSize <= 0) {
-      throw new Error("chunkSize and maxCacheSize must be positive numbers.");
-    }
-    this.dataSource = options.dataSource;
-    this.chunkSize = options.chunkSize;
-    this.maxCacheSize = options.maxCacheSize;
-  }
-
-  /**
-   * Initializes the proxy by fetching essential metadata from the data source.
-   * This method must be called before any other methods are used.
-   */
-  public async init(): Promise<void> {
-    if (this.metadata) {
-      return;
-    }
-    this.metadata = await this.dataSource.getMetadata();
-    if (typeof this.metadata?.frameCount !== 'number') {
-        throw new Error("Metadata fetched from data source must include a 'frameCount' number property.");
-    }
-  }
-
-  /**
-   * Returns the metadata object fetched during initialization.
-   * @throws {Error} If the proxy has not been initialized.
-   */
-  public getMetadata(): any {
-    if (!this.metadata) {
-      throw new Error("TrajectoryProxy not initialized. Call init() first.");
-    }
-    return this.metadata;
-  }
-
-  /**
-   * Returns the total number of frames in the trajectory.
-   * @throws {Error} If the proxy has not been initialized.
-   */
-  public getFrameCount(): number {
-    // The check in init() ensures metadata and frameCount exist and are valid.
-    return this.getMetadata().frameCount;
-  }
-
-  /**
-   * Retrieves a single frame, utilizing caching and pre-fetching strategies.
-   * @param frameIndex The index of the frame to retrieve.
-   * @returns A promise that resolves to the requested frame data.
-   */
-  public async getFrame(frameIndex: number): Promise<FrameData> {
-    if (!this.metadata) {
-      // Auto-initialize if not done already.
-      await this.init();
-    }
-    if (frameIndex < 0 || frameIndex >= this.getFrameCount()) {
-      throw new Error(`Frame index ${frameIndex} is out of bounds (0-${this.getFrameCount() - 1}).`);
-    }
-
-    const chunkIndex = Math.floor(frameIndex / this.chunkSize);
+    private metadata: any | null = null;
+    private frameSizeInBytes: number | null = null; // To be set in init
+    private framesPerChunk: number | null = null;
+    private isTransparent = false;
+    private lastRequestedChunkIndex: number | null = null;
     
-    // Asynchronously trigger pre-fetch for the next chunk, but don't wait for it.
-    this.prefetchNextChunk(chunkIndex);
+    private pendingFetches = new Map<number, Promise<FrameData[]>>();
 
-    // Get the required chunk, waiting if necessary.
-    const chunk = await this.getChunk(chunkIndex);
-    const frameOffset = frameIndex % this.chunkSize;
-    
-    return chunk[frameOffset];
-  }
+    constructor(options: {
+        dataSource: TrajectoryDataSource;
+        targetChunkSizeInBytes?: number;
+        l1CacheSizeInChunks?: number;
+        l2CacheSizeInBytes?: number;
+    }) {
+        this.dataSource = options.dataSource;
+        this.targetChunkSizeInBytes = options.targetChunkSizeInBytes ?? 1 * 1024 * 1024; // 1MB
+        this.l1CacheSizeInChunks = options.l1CacheSizeInChunks ?? 3;
+        this.l2CacheSizeInBytes = options.l2CacheSizeInBytes ?? 50 * 1024 * 1024; // 50MB
 
-  /**
-   * Retrieves a chunk of frames, handling cache hits, pending requests, and new fetches.
-   * This is the core of the concurrent request handling.
-   */
-  private getChunk(chunkIndex: number): Promise<FrameData[]> {
-    // Case A: Chunk is in the LRU cache. Return it immediately.
-    if (this.cache.has(chunkIndex)) {
-      const chunk = this.cache.get(chunkIndex)!;
-      this.updateLru(chunkIndex); // Mark as recently used.
-      return Promise.resolve(chunk);
+        this.l1Cache = new LRUCache<number, FrameData[]>(this.l1CacheSizeInChunks);
+        // L2 capacity is managed by size in bytes, not item count, so capacity is Infinity.
+        this.l2Cache = new LRUCache<number, { size: number }>(Infinity);
+
+        const dbName = `ngl-proxy-db-${Date.now()}-${Math.random()}`;
+        const storeName = 'chunks';
+        this.l2Store = createStore(dbName, storeName);
     }
 
-    // Case B: Chunk is already being fetched. Return the existing promise.
-    if (this.pendingFetches.has(chunkIndex)) {
-      return this.pendingFetches.get(chunkIndex)!;
+    public async init(): Promise<void> {
+        if (this.metadata) return;
+
+        this.metadata = await this.dataSource.getMetadata();
+        if (typeof this.metadata?.frameCount !== 'number') {
+            throw new Error("Metadata must include a 'frameCount' number property.");
+        }
+
+        const firstFrameArr = await this.dataSource.getFrames(0, 1);
+        if (!firstFrameArr || firstFrameArr.length === 0) {
+            throw new Error("Failed to fetch first frame to determine size.");
+        }
+        
+        const firstFrame = firstFrameArr[0];
+        this.frameSizeInBytes = firstFrame.coords.byteLength + firstFrame.box.byteLength;
+
+        if (this.frameSizeInBytes > this.targetChunkSizeInBytes) {
+            this.isTransparent = true;
+            console.warn("Single frame size is larger than target chunk size. Proxy is in transparent mode.");
+        } else {
+            this.framesPerChunk = Math.max(1, Math.floor(this.targetChunkSizeInBytes / this.frameSizeInBytes));
+        }
+        console.log("TrajectoryProxy initialized:", {
+            frameCount: this.metadata.frameCount,
+            frameSizeInBytes: this.frameSizeInBytes,
+            framesPerChunk: this.framesPerChunk,
+            isTransparent: this.isTransparent,
+        });
     }
 
-    // Case C: Chunk is not available. Fetch it.
-    const start = chunkIndex * this.chunkSize;
-    const end = Math.min((chunkIndex + 1) * this.chunkSize, this.getFrameCount());
-
-    const fetchPromise = this.dataSource.getFrames(
-      start,
-      end
-    ).then(chunkData => {
-      this.pendingFetches.delete(chunkIndex);
-      this.cache.set(chunkIndex, chunkData);
-      this.evictLru();
-      return chunkData;
-    }).catch(err => {
-      // On failure, remove the promise to allow for retries.
-      this.pendingFetches.delete(chunkIndex);
-      throw err;
-    });
-
-    this.pendingFetches.set(chunkIndex, fetchPromise);
-    return fetchPromise;
-  }
-
-  /**
-   * Initiates a "fire-and-forget" pre-fetch for the next chunk if it's not
-   * already cached or being fetched.
-   */
-  private prefetchNextChunk(currentChunkIndex: number): void {
-    const nextChunkIndex = currentChunkIndex + 1;
-    const totalChunks = Math.ceil(this.getFrameCount() / this.chunkSize);
-
-    if (nextChunkIndex >= totalChunks) {
-      return; // No more chunks to prefetch.
+    public getMetadata(): any {
+        if (!this.metadata) {
+            throw new Error("Proxy not initialized. Call init() first.");
+        }
+        return this.metadata;
     }
 
-    if (!this.cache.has(nextChunkIndex) && !this.pendingFetches.has(nextChunkIndex)) {
-      // We call getChunk but don't await it. Errors are caught to prevent unhandled promise rejections.
-      this.getChunk(nextChunkIndex).catch(error => {
-        console.error(`Error pre-fetching chunk ${nextChunkIndex}:`, error);
-      });
+    public getFrameCount(): number {
+        if (!this.metadata) {
+            throw new Error("Proxy not initialized. Call init() first.");
+        }
+        return this.metadata.frameCount;
     }
-  }
 
-  /**
-   * Moves a chunk to the end of the cache map to mark it as recently used.
-   */
-  private updateLru(chunkIndex: number): void {
-    const chunkData = this.cache.get(chunkIndex);
-    if (chunkData) {
-      this.cache.delete(chunkIndex);
-      this.cache.set(chunkIndex, chunkData);
-    }
-  }
+    public async getFrame(frameIndex: number): Promise<FrameData> {
+        if (!this.metadata || this.framesPerChunk === null && !this.isTransparent) {
+            throw new Error("Proxy not initialized. Call init() first.");
+        }
+        if (frameIndex < 0 || frameIndex >= this.getFrameCount()) {
+            throw new Error(`Frame index ${frameIndex} is out of bounds.`);
+        }
 
-  /**
-   * Evicts the least recently used items from the cache if it exceeds max size.
-   */
-  private evictLru(): void {
-    while (this.cache.size > this.maxCacheSize) {
-      // A Map iterates in insertion order, so the first key is the oldest.
-      const oldestChunkIndex = this.cache.keys().next().value;
-      // The iterator's result can be undefined in theory, so we must check.
-      if (oldestChunkIndex !== undefined) {
-        this.cache.delete(oldestChunkIndex);
-      } else {
-        // This case should not be reachable if cache.size > 0, but we break to be safe.
-        break;
-      }
+        if (this.isTransparent) {
+            const frame = await this.dataSource.getFrames(frameIndex, frameIndex + 1);
+            return frame[0];
+        }
+
+        const framesPerChunk = this.framesPerChunk!;
+        const currentChunkIndex = Math.floor(frameIndex / framesPerChunk);
+
+        if (currentChunkIndex !== this.lastRequestedChunkIndex) {
+            this.prefetchNextChunk(currentChunkIndex + 1);
+            this.lastRequestedChunkIndex = currentChunkIndex;
+        }
+
+        const chunk = await this.getOrFetchChunk(currentChunkIndex);
+        const frameOffset = frameIndex % framesPerChunk;
+        return chunk[frameOffset];
     }
-  }
+
+    private async getOrFetchChunk(chunkIndex: number): Promise<FrameData[]> {
+        // L1 Hit
+        const l1Data = this.l1Cache.get(chunkIndex);
+        if (l1Data) {
+            return l1Data;
+        }
+
+        // L2 Hit
+        if (this.l2Cache.has(chunkIndex)) {
+            const chunkData = await get<FrameData[]>(chunkIndex, this.l2Store);
+            if (chunkData) {
+                this.l2Cache.get(chunkIndex); // Update L2 LRU
+                this.addChunkToL1(chunkIndex, chunkData); // Promote to L1
+                return chunkData;
+            }
+        }
+        
+        // Miss: Fetch from source
+        if (this.pendingFetches.has(chunkIndex)) {
+            return this.pendingFetches.get(chunkIndex)!;
+        }
+
+        const fetchPromise = (async () => {
+            try {
+                const start = chunkIndex * this.framesPerChunk!;
+                const end = Math.min((chunkIndex + 1) * this.framesPerChunk!, this.getFrameCount());
+                console.log(`Fetching chunk ${chunkIndex} (frames ${start} to ${end - 1}) from source...`);
+                const chunkData = await this.dataSource.getFrames(start, end);
+
+                // Transactional write: L2 then L1
+                await this.addChunkToL2(chunkIndex, chunkData);
+                await this.addChunkToL1(chunkIndex, chunkData);
+
+                return chunkData;
+            } catch (error) {
+                console.error(`Failed to fetch/cache chunk ${chunkIndex}:`, error);
+                throw error;
+            }
+        })();
+        
+        this.pendingFetches.set(chunkIndex, fetchPromise);
+        fetchPromise.finally(() => {
+            this.pendingFetches.delete(chunkIndex);
+        });
+
+        return fetchPromise;
+    }
+
+    private async addChunkToL1(chunkIndex: number, chunkData: FrameData[]): Promise<void> {
+        const evicted = this.l1Cache.set(chunkIndex, chunkData).evicted;
+        // L1 eviction doesn't require further action
+    }
+
+    private async addChunkToL2(chunkIndex: number, chunkData: FrameData[]): Promise<void> {
+        if (this.frameSizeInBytes === null) {
+            // This should not happen if init() was called, but as a safeguard:
+            throw new Error("frameSizeInBytes is not initialized. Cannot calculate chunk size.");
+        }
+        const chunkSize = chunkData.length * this.frameSizeInBytes;
+        
+        this.l2CurrentSizeInBytes += chunkSize;
+        const evicted = this.l2Cache.set(chunkIndex, { size: chunkSize }).evicted;
+        if(evicted) {
+            this.l2CurrentSizeInBytes -= evicted.value.size;
+            await del(evicted.key, this.l2Store);
+        }
+
+        await set(chunkIndex, chunkData, this.l2Store);
+
+        // Evict more if over budget
+        while (this.l2CurrentSizeInBytes > this.l2CacheSizeInBytes) {
+            const evicted = this.l2Cache.set(chunkIndex, { size: chunkSize }).evicted;
+            if (evicted) {
+                this.l2CurrentSizeInBytes -= evicted.value.size;
+                await del(evicted.key, this.l2Store);
+            } else {
+                break; // Should not happen if size > 0
+            }
+        }
+    }
+
+    private prefetchNextChunk(chunkIndex: number): void {
+        const totalChunks = Math.ceil(this.getFrameCount() / this.framesPerChunk!);
+        if (chunkIndex >= totalChunks) return;
+
+        if (!this.l1Cache.has(chunkIndex) && !this.l2Cache.has(chunkIndex) && !this.pendingFetches.has(chunkIndex)) {
+            this.getOrFetchChunk(chunkIndex).catch(error => {
+                console.error(`Error pre-fetching chunk ${chunkIndex}:`, error);
+            });
+        }
+    }
 }
