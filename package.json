@@ -25,5 +25,8 @@
     "ngl-data-proxy": "^0.1.0",
     "typescript": "^5.9.2",
     "vite": "^7.1.3"
+  },
+  "dependencies": {
+    "idb-keyval": "^6.2.2"
   }
 }

@@ -1,13 +1,13 @@
 declare const NGL: any;
-// import { TrajectoryProxy } from '../src/TrajectoryProxy';
-import { TrajectoryProxy } from 'ngl-data-proxy';
+import { TrajectoryProxy } from '../src/TrajectoryProxy';
+// import { TrajectoryProxy } from 'ngl-data-proxy';
 import { MdsrvDataSource as CustomMdsrvDataSource } from './MdsrvDataSource';
 
 // --- Configuration ---
 const SERVER_BASE_URL = 'http://127.0.0.1:38359/';
 const TRAJECTORY_ROOT = 'cwd';
-const STRUCTURE_FILENAME = 'data/md.gro';
-const TRAJECTORY_FILENAME = 'data/md.xtc';
+const STRUCTURE_FILENAME = 'data/ala3.pdb';
+const TRAJECTORY_FILENAME = 'data/ala3.dcd';
 
 // --- UI Elements ---
 const playBtn = document.getElementById('playBtn') as HTMLButtonElement;
@@ -39,8 +39,8 @@ async function main() {
 
   const proxy = new TrajectoryProxy({
     dataSource: customDataSource,
-    chunkSize: 100,
-    maxCacheSize: 10,
+    targetChunkSizeInBytes: 4 * 1024 * 1024, // 1MB
+    l2CacheSizeInBytes: 30 * 1024 * 1024, // 30MB
   });
 
   try {
