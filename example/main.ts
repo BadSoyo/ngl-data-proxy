@@ -114,7 +114,9 @@ async function main() {
     player = new NGL.TrajectoryPlayer(traj, {
       step: 1,
       timeout: 60, // milliseconds
-      mode: 'loop'
+      mode: 'loop',
+      interpolateStep: 16,
+      interpolateType: "linear",
     });
 
     traj.signals.frameChanged.add((value: number) => {
