@@ -148,11 +148,17 @@ async function main() {
   };
 
   slider.oninput = () => {
+    let tempPause = false;
     if (traj) {
-      player.pause();
+      if (isPlaying) {
+        player.pause();
+        tempPause = true;
+      }
       const frame = parseInt(slider.value, 10);
       traj.setFrame(frame);
-      player.play(); // Resume playback after scrubbing
+      if (tempPause) {
+        player.play(); // Resume playback after scrubbing
+      }
     }
   };
 }
