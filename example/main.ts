@@ -149,14 +149,10 @@ async function main() {
 
   slider.oninput = () => {
     if (traj) {
-      if (isPlaying) {
-        console.log('Scrubbing detected, pausing playback.');
-        player.pause();
-        isPlaying = false;
-        playBtn.textContent = 'Play';
-      }
+      player.pause();
       const frame = parseInt(slider.value, 10);
       traj.setFrame(frame);
+      player.play(); // Resume playback after scrubbing
     }
   };
 }
